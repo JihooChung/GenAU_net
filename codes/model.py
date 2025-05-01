@@ -1,5 +1,5 @@
-!pip install kagglehub==0.3.6
-!pip install albumentations
+pip install kagglehub==0.3.6
+pip install albumentations
 
 import kagglehub
 import numpy as np
@@ -8,7 +8,6 @@ import pandas as pd
 import os
 import cv2
 import matplotlib.pyplot as plt
-import seaborn as sns
 
 from tqdm.notebook import tqdm
 import time
@@ -24,8 +23,6 @@ from albumentations.pytorch import ToTensorV2
 from sklearn.model_selection import train_test_split
 from scipy.spatial.distance import cdist
 
-#-----------Data Preprocessing-----------
-
 BASE_PATH= "/kaggle/input/lgg-mri-segmentation/kaggle_3m"
 BASE_LEN = 27
 BASE_LEN = 67
@@ -40,9 +37,11 @@ torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 random.seed(SEED)
 
+#-----------Data Loading-----------
+
 path = kagglehub.dataset_download("mateuszbuda/lgg-mri-segmentation")
 
-  data = []
+data = []
 
 for dir_ in os.listdir(BASE_PATH):
     dir_path = os.path.join(BASE_PATH, dir_)
@@ -93,6 +92,8 @@ gene_dff["diagnosis"] = gene_dff["mask_path"].apply(lambda x: pos_neg_diagnosis(
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+#-----------Data Preprocessing-----------
+
 class BrainMRIDataset:
     def __init__(self, df, transforms):
         self.df = df
@@ -115,7 +116,19 @@ class BrainMRIDataset:
           mask = mask.unsqueeze(0)  # 1, H, W
 
         return image, mask, gene_info
-      
+
+def custom_collate_fn(batch):
+    images, masks, gene_infos = zip(*batch)
+    images = torch.stack(images)
+    masks = torch.stack(masks)
+    return images, masks, list(gene_infos)
+  
+def seed_worker(worker_id):
+    worker_seed = SEED + worker_id
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
+
 PATCH_SIZE = 128
 
 transforms = A.Compose([
@@ -140,18 +153,6 @@ test_df = gene_dff[gene_dff['patient'].isin(test_patients)].reset_index(drop=Tru
 
 #print(f"Train: {train_df.shape} Val: {val_df.shape} Test: {test_df.shape}")
 # -> Train: (3092, 5) Val: (431, 5) Test: (406, 5)
-
-def custom_collate_fn(batch):
-    images, masks, gene_infos = zip(*batch)
-    images = torch.stack(images)
-    masks = torch.stack(masks)
-    return images, masks, list(gene_infos)
-  
-def seed_worker(worker_id):
-    worker_seed = SEED + worker_id
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-    torch.manual_seed(worker_seed)
 
 g = torch.Generator()
 g.manual_seed(SEED)
@@ -203,7 +204,7 @@ class UpConvBlock(nn.Module):
         x = x = self.up(x)
         return x
 
-class AttentionBlock_a1fs(nn.Module):
+class GABlock(nn.Module):
     def __init__(self, f_g, f_l, f_int, gene_info_size=7):
         super().__init__()
 
@@ -248,7 +249,7 @@ class AttentionBlock_a1fs(nn.Module):
 
         return psi*x
 
-class AttentionUNet_a1fs(nn.Module):
+class GenAU_net(nn.Module):
     def __init__(self, n_classes=1, in_channel=3, out_channel=1):
         super().__init__()
 
@@ -261,19 +262,19 @@ class AttentionUNet_a1fs(nn.Module):
         self.conv5 = ConvBlock(ch_in=512, ch_out=1024)
 
         self.up5 = UpConvBlock(ch_in=1024, ch_out=512)
-        self.att5 = AttentionBlock_a1fs(f_g=512, f_l=512, f_int=256)
+        self.att5 = GABlock(f_g=512, f_l=512, f_int=256)
         self.upconv5 = ConvBlock(ch_in=1024, ch_out=512)
 
         self.up4 = UpConvBlock(ch_in=512, ch_out=256)
-        self.att4 = AttentionBlock_a1fs(f_g=256, f_l=256, f_int=128)
+        self.att4 = GABlock(f_g=256, f_l=256, f_int=128)
         self.upconv4 = ConvBlock(ch_in=512, ch_out=256)
 
         self.up3 = UpConvBlock(ch_in=256, ch_out=128)
-        self.att3 = AttentionBlock_a1fs(f_g=128, f_l=128, f_int=64)
+        self.att3 = GABlock(f_g=128, f_l=128, f_int=64)
         self.upconv3 = ConvBlock(ch_in=256, ch_out=128)
 
         self.up2 = UpConvBlock(ch_in=128, ch_out=64)
-        self.att2 = AttentionBlock_a1fs(f_g=64, f_l=64, f_int=32)
+        self.att2 = GABlock(f_g=64, f_l=64, f_int=32)
         self.upconv2 = ConvBlock(ch_in=128, ch_out=64)
 
         self.conv_1x1 = nn.Conv2d(64, out_channel,
@@ -319,8 +320,8 @@ class AttentionUNet_a1fs(nn.Module):
 
         return d1
 
-a1fs = AttentionUNet_a1fs(n_classes=1).to(device)
-a1fs_opt = torch.optim.Adamax(a1fs.parameters(), lr=1e-3)
+genaunet = GenAU_net(n_classes=1).to(device)
+opt = torch.optim.Adamax(genaunet.parameters(), lr=1e-3)
 
 #-----------Model Training-----------
 
@@ -430,7 +431,7 @@ def train_model(model_name, model, train_loader, val_loader, train_loss, optimiz
 %%time
 num_ep = 50
 
-m2fr_lh, m2fr_th, m2fr_vh = train_model("Attention UNet", a1fs, train_dataloader, val_dataloader, DiceLoss(), a1fs_opt, False, num_ep)
+lh, th, vh = train_model("Attention UNet", genaunet, train_dataloader, val_dataloader, DiceLoss(), opt, False, num_ep)
 
 #-----------Model Evaluation-----------
 
@@ -535,7 +536,7 @@ def compute_metrics(model, loader, threshold=0.3, num_classes=2):
         "ASSD": (np.nanmean(all_assd_scores), np.nanstd(all_assd_scores))
     }
 
-print(compute_metrics(a1fs, test_dataloader, threshold=0.3, num_classes=2))
+print(compute_metrics(genaunet, test_dataloader, threshold=0.3, num_classes=2))
 
 def visualize_segmentation(model, loader, num_samples=5, threshold=0.3):
     model.eval()
@@ -603,4 +604,4 @@ def visualize_segmentation(model, loader, num_samples=5, threshold=0.3):
     plt.tight_layout()
     plt.show()
 
-visualize_segmentation(a1fs, test_dataloader, num_samples=10, threshold=0.3)
+visualize_segmentation(genaunet, test_dataloader, num_samples=10, threshold=0.3)
